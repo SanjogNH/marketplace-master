@@ -572,8 +572,8 @@
         <div class="step-num">1</div>
         <div class="step-content">
           <strong>Create four sheet tabs:</strong><br>
-          • <code>SKU Listings</code> — 16 cols: <code>Timestamp | Platform SKU | Parent NH SKU | Child Codes | GST | EAN | MRP | Platform Name | Channel SKU | Shelf Life | Status | Uploader | Warehouses | Approval | Row ID | Version</code><br>
-          • <code>SKU History</code> — 18 cols: <code>Archived At | Platform SKU | Parent NH SKU | Child Codes | GST | EAN | MRP | Platform Name | Channel SKU | Shelf Life | Status | Uploader | Warehouses | Approval | Row ID | Version | Original Timestamp | Changed Fields</code><br>
+          • <code>SKU Listings</code> — 18 cols: <code>Timestamp | Platform SKU | Parent NH SKU | Child Codes | GST | EAN | MRP | Platform Name | Channel SKU | Shelf Life | Status | Uploader | Warehouses | Approval | Row ID | Version | Barcode | Grand Parent Code</code><br>
+          • <code>SKU History</code> — 20 cols: <code>Archived At | Platform SKU | Parent NH SKU | Child Codes | GST | EAN | MRP | Platform Name | Channel SKU | Shelf Life | Status | Uploader | Warehouses | Approval | Row ID | Version | Original Timestamp | Changed Fields | Barcode | Grand Parent Code</code><br>
           • <code>Uploaders</code> — 1 col: <code>Name</code> in A1, then one name per row from A2. Pre-filled with your 10 names. Add more anytime — they appear in the portal on next load.<br>
           • <code>Bulk Upload Log</code> — optional, for tracking bulk job history (script auto-creates entries).<br><br>
           <strong>Uploaders tab — initial data (paste into A1:A11):</strong><br>
@@ -591,7 +591,21 @@ const HIST_SHEET    = "SKU History";
 const UPLDR_SHEET   = "Uploaders";
 const BULKLOG_SHEET = "Bulk Upload Log";
 
-/* ── CORS-safe response — works from file://, any origin ── */
+// SKU Listings headers (18 cols)
+const MAIN_HEADERS = [
+  "Timestamp","Platform SKU","Parent NH SKU","Child Codes","GST","EAN","MRP",
+  "Platform Name","Channel SKU","Shelf Life","Status","Uploader","Warehouses",
+  "Approval","Row ID","Version","Barcode","Grand Parent Code"
+];
+// SKU History headers (20 cols)
+const HIST_HEADERS = [
+  "Archived At","Platform SKU","Parent NH SKU","Child Codes","GST","EAN","MRP",
+  "Platform Name","Channel SKU","Shelf Life","Status","Uploader","Warehouses",
+  "Approval","Row ID","Version","Original Timestamp","Changed Fields",
+  "Barcode","Grand Parent Code"
+];
+
+/* ── CORS-safe response ── */
 function cors(obj) {
   return ContentService
     .createTextOutput(JSON.stringify(obj))
@@ -599,10 +613,8 @@ function cors(obj) {
 }
 
 function doOptions(e) {
-  return ContentService.createTextOutput("")
-    .setMimeType(ContentService.MimeType.TEXT);
+  return ContentService.createTextOutput("").setMimeType(ContentService.MimeType.TEXT);
 }
-
 function doGet(e)  { return handleRequest(e); }
 function doPost(e) { return handleRequest(e); }
 
@@ -622,10 +634,17 @@ function handleRequest(e) {
   }
 }
 
+/* ── get or create sheet, auto-write headers if empty ── */
 function getSheet(name) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   let sheet = ss.getSheetByName(name);
   if (!sheet) sheet = ss.insertSheet(name);
+  if (sheet.getLastRow() === 0) {
+    const headers = name === MAIN_SHEET ? MAIN_HEADERS
+                  : name === HIST_SHEET ? HIST_HEADERS
+                  : null;
+    if (headers) sheet.appendRow(headers);
+  }
   return sheet;
 }
 
@@ -652,77 +671,113 @@ function rowToObj(r) {
     timestamp: r[0], platformSKU: r[1], parentSKU: r[2], childCodes: r[3],
     gst: r[4], ean: r[5], mrp: r[6], platformName: r[7], channelSKU: r[8],
     shelfLife: r[9], status: r[10], uploaderName: r[11], warehouseMapping: r[12],
-    approval: r[13], rowId: r[14], version: r[15] || 1
+    approval: r[13], rowId: r[14], version: r[15] || 1,
+    barcode: r[16] || "", grandParentCode: r[17] || ""
   };
 }
 
 /* ── upsert (new or update) ── */
-function upsertSKU(data, mainSheet, histSheet) {
-  const rows     = mainSheet.getDataRange().getValues();
+// Accepts optional pre-loaded sheet data for bulk mode (avoids re-reading sheet per row)
+function upsertSKU(data, mainSheet, histSheet, _cachedRows, _rowIndex) {
   const now      = new Date().toISOString();
   const childStr = Array.isArray(data.childCodes) ? data.childCodes.join("+") : (data.childCodes || "");
   const wh       = Array.isArray(data.warehouseMapping) ? data.warehouseMapping.join(", ") : (data.warehouseMapping || "");
+  const barcode  = data.barcode || "";
+  const gpc      = data.grandParentCode || "";
 
-  for (let i = 1; i < rows.length; i++) {
-    if (String(rows[i][1]).trim() === String(data.platformSKU).trim()) {
-      const old        = rows[i];
-      const oldVersion = Number(old[15]) || 1;
-      const fieldMap   = {
-        "Parent NH SKU": [old[2],  data.parentSKU],
-        "Child Codes":   [old[3],  childStr],
-        "GST":           [old[4],  data.gst],
-        "EAN":           [old[5],  data.ean],
-        "MRP":           [old[6],  data.mrp],
-        "Platform Name": [old[7],  data.platformName],
-        "Channel SKU":   [old[8],  data.channelSKU],
-        "Shelf Life":    [old[9],  data.shelfLife],
-        "Status":        [old[10], data.status],
-        "Uploader":      [old[11], data.uploaderName],
-        "Warehouses":    [old[12], wh]
-      };
-      const changed = Object.entries(fieldMap)
-        .filter(([,[o,n]]) => String(o).trim() !== String(n).trim())
-        .map(([k]) => k);
-
-      histSheet.appendRow([
-        now, old[1], old[2], old[3], old[4], old[5], old[6],
-        old[7], old[8], old[9], old[10], old[11], old[12],
-        old[13], old[14], oldVersion, old[0], changed.join(", ")
-      ]);
-
-      mainSheet.getRange(i + 1, 1, 1, 16).setValues([[
-        now, data.platformSKU, data.parentSKU, childStr,
-        data.gst, data.ean, data.mrp, data.platformName,
-        data.channelSKU, data.shelfLife, data.status,
-        data.uploaderName, wh, "Pending", old[14], oldVersion + 1
-      ]]);
-      return { success: true, type: "updated", version: oldVersion + 1, changedFields: changed };
+  // Use cached rows in bulk mode, otherwise read from sheet
+  const rows  = _cachedRows || mainSheet.getDataRange().getValues();
+  const idx   = _rowIndex !== undefined ? _rowIndex : (() => {
+    for (let i = 1; i < rows.length; i++) {
+      if (String(rows[i][1]).trim() === String(data.platformSKU).trim()) return i;
     }
+    return -1;
+  })();
+
+  if (idx !== -1) {
+    const old        = rows[idx];
+    const oldVersion = Number(old[15]) || 1;
+    const fieldMap   = {
+      "Parent NH SKU":    [old[2],  data.parentSKU],
+      "Child Codes":      [old[3],  childStr],
+      "GST":              [old[4],  data.gst],
+      "EAN":              [old[5],  data.ean],
+      "MRP":              [old[6],  data.mrp],
+      "Platform Name":    [old[7],  data.platformName],
+      "Channel SKU":      [old[8],  data.channelSKU],
+      "Shelf Life":       [old[9],  data.shelfLife],
+      "Status":           [old[10], data.status],
+      "Uploader":         [old[11], data.uploaderName],
+      "Warehouses":       [old[12], wh],
+      "Barcode":          [old[16] || "", barcode],
+      "Grand Parent Code":[old[17] || "", gpc]
+    };
+    const changed = Object.entries(fieldMap)
+      .filter(([,[o,n]]) => String(o).trim() !== String(n).trim())
+      .map(([k]) => k);
+
+    histSheet.appendRow([
+      now, old[1], old[2], old[3], old[4], old[5], old[6],
+      old[7], old[8], old[9], old[10], old[11], old[12],
+      old[13], old[14], oldVersion, old[0], changed.join(", "),
+      old[16] || "", old[17] || ""
+    ]);
+
+    const newRow = [
+      now, data.platformSKU, data.parentSKU, childStr,
+      data.gst, data.ean, data.mrp, data.platformName,
+      data.channelSKU, data.shelfLife, data.status,
+      data.uploaderName, wh, "Pending", old[14], oldVersion + 1,
+      barcode, gpc
+    ];
+    mainSheet.getRange(idx + 1, 1, 1, 18).setValues([newRow]);
+    // Keep cache in sync
+    if (_cachedRows) rows[idx] = newRow;
+    return { success: true, type: "updated", version: oldVersion + 1, changedFields: changed };
   }
 
-  const rowId = Utilities.getUuid();
-  mainSheet.appendRow([
+  const rowId  = Utilities.getUuid();
+  const newRow = [
     now, data.platformSKU, data.parentSKU, childStr,
     data.gst, data.ean, data.mrp, data.platformName,
     data.channelSKU, data.shelfLife, data.status,
-    data.uploaderName, wh, "Pending", rowId, 1
-  ]);
+    data.uploaderName, wh, "Pending", rowId, 1,
+    barcode, gpc
+  ];
+  mainSheet.appendRow(newRow);
+  // Keep cache in sync for later rows in the same batch
+  if (_cachedRows) _cachedRows.push(newRow);
   return { success: true, type: "created", version: 1 };
 }
 
-/* ── bulk submit ── */
+/* ── bulk submit — reads sheet ONCE, processes all rows, writes in one pass ── */
 function bulkSubmit(body) {
   const mainSheet = getSheet(MAIN_SHEET);
   const histSheet = getSheet(HIST_SHEET);
-  const results   = [];
+
+  // Build an in-memory index: platformSKU → rowIndex (1-based data index)
+  const allRows   = mainSheet.getDataRange().getValues();
+  const skuIndex  = {};
+  for (let i = 1; i < allRows.length; i++) {
+    skuIndex[String(allRows[i][1]).trim()] = i;
+  }
+
+  const results = [];
   for (const row of (body.rows || [])) {
     try {
-      const r = upsertSKU(row, mainSheet, histSheet);
+      const key = String(row.platformSKU).trim();
+      const idx = skuIndex.hasOwnProperty(key) ? skuIndex[key] : -1;
+      const r   = upsertSKU(row, mainSheet, histSheet, allRows, idx);
+      // If newly created, its row is now at the end — update index for potential duplicates in same batch
+      if (r.type === "created") {
+        skuIndex[key] = allRows.length - 1;
+      }
       results.push({ platformSKU: row.platformSKU, ...r });
     } catch(e) {
       results.push({ platformSKU: row.platformSKU, success: false, error: e.toString() });
     }
   }
+
   try {
     const logSheet = getSheet(BULKLOG_SHEET);
     if (logSheet.getLastRow() === 0)
@@ -754,7 +809,8 @@ function fetchHistory() {
       gst: r[4], ean: r[5], mrp: r[6], platformName: r[7], channelSKU: r[8],
       shelfLife: r[9], status: r[10], uploaderName: r[11], warehouseMapping: r[12],
       approval: r[13], rowId: r[14], version: r[15] || 1,
-      originalTimestamp: r[16], changedFields: r[17]
+      originalTimestamp: r[16], changedFields: r[17],
+      barcode: r[18] || "", grandParentCode: r[19] || ""
     }))
   };
 }</div>
@@ -806,7 +862,7 @@ function fetchHistory() {
 
 <script>
   // ─── CONFIG ───────────────────────────────────────────────────────────────
-  const SCRIPT_URL = "https://script.google.com/macros/s/AKfycbyaDM4_dqy0nRbbpay2kZM8TgTke7czS7LmwbgzY1iYbZd1MbmsPWmc82pP-NTyXlNB/exec";
+  const SCRIPT_URL = "https://script.googleusercontent.com/a/macros/nathabit.in/echo?user_content_key=AUkAhnQVln3nxS3AgaW1FXvGIKgXuHs32gOy8vUz2FwNCO-PnyvVWGU00uBUo2zRc5_8C_CJFSqVWNa14GNpHmdv8Yfar6hu3490ivkrNgJHrudl4MWQtdZJyEMORjPVx3FEZ_uCeiJItyF5G7PTZcDRAB4b96Pg4oN3JehbXlL5jsgjFgXKQAvBTiU2HA97V1ZTdBxXKyH-YKyeddvlQAoLJuqlIcrkGemORp0-f1umS6_TuDqFiRiTesAKsBE_DfffdIfLq7QPtvS8BMG8vHRlNLt9pu8pgWxBqL0klfxj&lib=My161K_mQ7nALYKBcvQKdz1hwL89NOhPq";
   // ─────────────────────────────────────────────────────────────────────────
 
   /* ── unified fetch helper — sends as text/plain to avoid CORS preflight ── */
@@ -1219,6 +1275,7 @@ function fetchHistory() {
     const validRows = bulkRows.filter(r => r._valid);
     if (!validRows.length) { showToast('No valid rows to submit','error'); return; }
 
+    const CHUNK_SIZE = 150; // safe limit per Apps Script execution (~30s)
     const btn  = document.getElementById('bulk-submit-btn');
     const wrap = document.getElementById('bulk-progress-wrap');
     const bar  = document.getElementById('bulk-progress-bar');
@@ -1226,50 +1283,63 @@ function fetchHistory() {
     btn.disabled = true;
     wrap.style.display = 'flex';
 
-    // Build payload — send in one batch
-    const payload = {
-      action: 'bulkSubmit',
-      submittedBy: validRows[0]?.uploaderName || '',
-      rows: validRows.map(r => ({
-        platformSKU:      r.platformSKU,
-        parentSKU:        r.parentSKU,
-        childCodes:       r.childCodes.split('+').map(s=>s.trim()).filter(Boolean),
-        gst:              r.gst,
-        ean:              r.ean,
-        mrp:              r.mrp,
-        platformName:     r.platformName,
-        channelSKU:       r.channelSKU,
-        shelfLife:        r.shelfLife,
-        status:           r.status,
-        uploaderName:     r.uploaderName,
-        warehouseMapping: r.warehouseMapping.split(',').map(w=>w.trim()).filter(Boolean),
-        barcode:          r.barcode || '',
-        grandParentCode:  r.grandParentCode || ''
-      }))
-    };
+    const rowPayloads = validRows.map(r => ({
+      platformSKU:      r.platformSKU,
+      parentSKU:        r.parentSKU,
+      childCodes:       r.childCodes.split('+').map(s=>s.trim()).filter(Boolean),
+      gst:              r.gst,
+      ean:              r.ean,
+      mrp:              r.mrp,
+      platformName:     r.platformName,
+      channelSKU:       r.channelSKU,
+      shelfLife:        r.shelfLife,
+      status:           r.status,
+      uploaderName:     r.uploaderName,
+      warehouseMapping: r.warehouseMapping.split(',').map(w=>w.trim()).filter(Boolean),
+      barcode:          r.barcode || '',
+      grandParentCode:  r.grandParentCode || ''
+    }));
 
-    lbl.textContent = `Submitting ${validRows.length} rows…`;
-    bar.style.width = '30%';
+    // Chunk into batches
+    const chunks = [];
+    for (let i = 0; i < rowPayloads.length; i += CHUNK_SIZE)
+      chunks.push(rowPayloads.slice(i, i + CHUNK_SIZE));
 
-    try {
-      bar.style.width = '30%';
-      const result = await gs(payload);
-      bar.style.width = '100%';
+    let totalCreated = 0, totalUpdated = 0, totalFailed = 0;
+    const submitter = validRows[0]?.uploaderName || '';
 
-      if (result.success) {
-        const created  = result.results.filter(r=>r.type==='created').length;
-        const updated  = result.results.filter(r=>r.type==='updated').length;
-        const failed   = result.results.filter(r=>!r.success).length;
-        lbl.textContent = `Done — ${created} created, ${updated} updated${failed?', '+failed+' failed':''}`;
-        showToast(`Bulk upload complete: ${created} new, ${updated} updated.`, 'success');
-        if (updated > 0) bumpHistoryBadge();
-        setTimeout(clearBulk, 3000);
-      } else throw new Error(result.error || 'Unknown error');
-    } catch(e) {
-      lbl.textContent = 'Error: ' + e.message;
-      showToast('Bulk upload failed: ' + e.message, 'error');
-      btn.disabled = false;
+    for (let ci = 0; ci < chunks.length; ci++) {
+      const pct = Math.round(((ci) / chunks.length) * 90);
+      bar.style.width = pct + '%';
+      lbl.textContent = `Batch ${ci+1} of ${chunks.length} — ${Math.min((ci+1)*CHUNK_SIZE, rowPayloads.length)} / ${rowPayloads.length} rows…`;
+
+      try {
+        const result = await gs({
+          action: 'bulkSubmit',
+          submittedBy: submitter,
+          rows: chunks[ci]
+        });
+        if (result.success) {
+          totalCreated += result.results.filter(r=>r.type==='created').length;
+          totalUpdated += result.results.filter(r=>r.type==='updated').length;
+          totalFailed  += result.results.filter(r=>!r.success).length;
+        } else {
+          throw new Error(result.error || 'Unknown error on batch ' + (ci+1));
+        }
+      } catch(e) {
+        bar.style.background = 'var(--red)';
+        lbl.textContent = `Failed on batch ${ci+1}: ${e.message}`;
+        showToast(`Bulk upload failed on batch ${ci+1}: ${e.message}`, 'error');
+        btn.disabled = false;
+        return;
+      }
     }
+
+    bar.style.width = '100%';
+    lbl.textContent = `Done — ${totalCreated} created, ${totalUpdated} updated${totalFailed?', '+totalFailed+' failed':''}`;
+    showToast(`Bulk upload complete: ${totalCreated} new, ${totalUpdated} updated.`, 'success');
+    if (totalUpdated > 0) bumpHistoryBadge();
+    setTimeout(clearBulk, 3500);
   }
 
   function clearBulk() {
